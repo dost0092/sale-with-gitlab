@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
+main.py
 Foreclosure Sales Scraper (One-Time Full Load + Incremental Updates Thereafter)
 
-- Runs headless with Playwright.
-- Writes to Google Sheets using a Service Account.
-- First-ever run (sheet "All Data" missing) -> full scrape for all TARGET_COUNTIES.
-- Subsequent runs -> incremental updates (only new Property IDs) with a dated snapshot header.
-- Robust retries & error handling so one county's failure won't stop the rest.
-- Designed to run as a one-off script in CI/CD (no web server).
-
-ENV VARS REQUIRED:
-  - GOOGLE_CREDENTIALS  (the raw JSON of your Google Service Account)
-  - SPREADSHEET_ID      (target Google Sheet ID)
+Environment variables required:
+  - SPREADSHEET_ID   (Google Sheets ID)
+  - Either:
+      - GOOGLE_CREDENTIALS_FILE (GitLab "File" variable path), OR
+      - GOOGLE_CREDENTIALS (raw JSON string), OR
+      - GOOGLE_CREDENTIALS (a path to a local JSON file)
 """
 
 import os
 import re
 import sys
 import json
-import time
 import asyncio
 import pandas as pd
 from datetime import datetime
@@ -32,16 +27,13 @@ from googleapiclient.errors import HttpError
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# ==============================
-# Configuration
-# ==============================
+# -----------------------------
+# Config
+# -----------------------------
 BASE_URL = "https://salesweb.civilview.com/"
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-CREDENTIALS_FILE_PATH = "service_account.json"
-
 TARGET_COUNTIES = [
     {"county_id": "52", "county_name": "Cape May County, NJ"},
-    # {"county_id": "25", "county_name": "Atlantic County, NJ"},
     {"county_id": "1",  "county_name": "Camden County, NJ"},
     {"county_id": "3",  "county_name": "Burlington County, NJ"},
     {"county_id": "6",  "county_name": "Cumberland County, NJ"},
@@ -50,75 +42,76 @@ TARGET_COUNTIES = [
     {"county_id": "15", "county_name": "Union County, NJ"},
 ]
 
-# How long to wait between counties (be polite)
 POLITE_DELAY_SECONDS = 1.5
-
-# Max retries for page nav & scraping
 MAX_RETRIES = 3
 
-# ==============================
-# Helpers
-# ==============================
-def create_service_account_file():
-    """Creates the service account file from a JSON string environment variable."""
-    credentials_json = os.environ.get("GOOGLE_CREDENTIALS")
-    if not credentials_json:
-        raise ValueError("GOOGLE_CREDENTIALS environment variable not set.")
-    try:
-        with open(CREDENTIALS_FILE_PATH, "w", encoding="utf-8") as f:
-            f.write(credentials_json)
-        print("✓ Service account file created from environment variable.")
-    except Exception as e:
-        print(f"✗ Error creating service account file: {e}")
-        raise
+# -----------------------------
+# Credential helpers
+# -----------------------------
+def load_service_account_info():
+    """
+    Loads service account JSON from:
+      1) GOOGLE_CREDENTIALS_FILE (File variable path) OR
+      2) GOOGLE_CREDENTIALS raw JSON string OR
+      3) GOOGLE_CREDENTIALS path to local file
+    Returns parsed dict or raises ValueError.
+    """
+    file_env = os.environ.get("GOOGLE_CREDENTIALS_FILE")
+    if file_env:
+        if os.path.exists(file_env):
+            try:
+                with open(file_env, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except Exception as e:
+                raise ValueError(f"Failed to read JSON from GOOGLE_CREDENTIALS_FILE ({file_env}): {e}")
+        else:
+            raise ValueError(f"GOOGLE_CREDENTIALS_FILE is set but file does not exist: {file_env}")
 
-def norm_text(s: str) -> str:
-    if not s:
-        return ""
-    return re.sub(r"\s+", " ", s).strip()
+    creds_raw = os.environ.get("GOOGLE_CREDENTIALS")
+    if not creds_raw:
+        raise ValueError("Environment variable GOOGLE_CREDENTIALS (or GOOGLE_CREDENTIALS_FILE) not set.")
 
-def extract_property_id_from_href(href: str) -> str:
-    try:
-        q = parse_qs(urlparse(href).query)
-        return q.get("PropertyId", [""])[0]
-    except Exception:
-        return ""
-
-def today_header_label(prefix="Snapshot for"):
-    return f"{prefix} {datetime.now().strftime('%A - %Y-%m-%d')}"
-
-def safe_sheet_title(name: str) -> str:
-    # Google Sheets tab title limit is 100, but let's keep it short & safe
-    return name[:30]
-
-# ==============================
-# Google Sheets Client
-# ==============================
-class SheetsClient:
-    def __init__(self, spreadsheet_id: str):
-        self.spreadsheet_id = spreadsheet_id
-        self.service = None
-        self._init_client()
-
-    def _init_client(self):
+    creds_raw_stripped = creds_raw.strip()
+    # Case: raw JSON string
+    if creds_raw_stripped.startswith("{"):
         try:
-            creds = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE_PATH, scopes=SCOPES)
-            self.service = build('sheets', 'v4', credentials=creds)
-            print("✓ Google Sheets API client initialized.")
-        except Exception as e:
-            print(f"✗ Error initializing Google Sheets client: {e}")
-            self.service = None
+            return json.loads(creds_raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"GOOGLE_CREDENTIALS contains invalid JSON: {e}")
 
-    def _svc(self):
-        if not self.service:
-            raise RuntimeError("Google Sheets service not initialized")
-        return self.service.spreadsheets()
+    # Case: path to file
+    if os.path.exists(creds_raw):
+        try:
+            with open(creds_raw, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception as e:
+            raise ValueError(f"GOOGLE_CREDENTIALS is a path but failed to load JSON: {e}")
+
+    raise ValueError("GOOGLE_CREDENTIALS is set but not valid JSON and not an existing file path.")
+
+def init_sheets_service_from_env():
+    info = load_service_account_info()
+    try:
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        service = build('sheets', 'v4', credentials=creds)
+        return service
+    except Exception as e:
+        raise RuntimeError(f"Failed to create Google Sheets client: {e}")
+
+# -----------------------------
+# Sheets client wrapper
+# -----------------------------
+class SheetsClient:
+    def __init__(self, spreadsheet_id: str, service):
+        self.spreadsheet_id = spreadsheet_id
+        self.service = service
+        self.svc = self.service.spreadsheets()
 
     def spreadsheet_info(self):
         try:
-            return self._svc().get(spreadsheetId=self.spreadsheet_id).execute()
+            return self.svc.get(spreadsheetId=self.spreadsheet_id).execute()
         except HttpError as e:
-            print(f"✗ Error fetching spreadsheet info: {e}")
+            print(f"⚠ Error fetching spreadsheet info: {e}")
             return {}
 
     def sheet_exists(self, sheet_name: str) -> bool:
@@ -133,37 +126,28 @@ class SheetsClient:
             return
         try:
             req = {"addSheet": {"properties": {"title": sheet_name}}}
-            self._svc().batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": [req]}).execute()
-            print(f"✓ Created new sheet: {sheet_name}")
+            self.svc.batchUpdate(spreadsheetId=self.spreadsheet_id, body={"requests": [req]}).execute()
+            print(f"✓ Created sheet: {sheet_name}")
         except HttpError as e:
-            # If the sheet was created by a concurrent run, ignore "already exists" type errors
             print(f"⚠ create_sheet_if_missing error on '{sheet_name}': {e}")
 
     def get_values(self, sheet_name: str, rng: str = "A:Z"):
         try:
-            res = self._svc().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"'{sheet_name}'!{rng}"
-            ).execute()
+            res = self.svc.values().get(spreadsheetId=self.spreadsheet_id, range=f"'{sheet_name}'!{rng}").execute()
             return res.get("values", [])
         except HttpError as e:
-            if "Unable to parse range" in str(e) or "not found" in str(e):
-                return []
-            print(f"⚠ get_values error on '{sheet_name}': {e}")
+            # return empty if sheet missing
             return []
 
     def clear(self, sheet_name: str, rng: str = "A:Z"):
         try:
-            self._svc().values().clear(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"'{sheet_name}'!{rng}"
-            ).execute()
+            self.svc.values().clear(spreadsheetId=self.spreadsheet_id, range=f"'{sheet_name}'!{rng}").execute()
         except HttpError as e:
             print(f"⚠ clear error on '{sheet_name}': {e}")
 
     def write_values(self, sheet_name: str, values, start_cell: str = "A1"):
         try:
-            self._svc().values().update(
+            self.svc.values().update(
                 spreadsheetId=self.spreadsheet_id,
                 range=f"'{sheet_name}'!{start_cell}",
                 valueInputOption="USER_ENTERED",
@@ -174,34 +158,42 @@ class SheetsClient:
             raise
 
     def prepend_snapshot(self, sheet_name: str, header_row, new_rows):
-        """
-        Prepend a dated snapshot (header + header_row + new_rows + blank) ABOVE existing contents.
-        If there are no existing values, this just writes the snapshot.
-        """
         existing = self.get_values(sheet_name, "A:Z")
-        snapshot_header = [[today_header_label()]]
+        snapshot_header = [[f"Snapshot for {datetime.now().strftime('%A - %Y-%m-%d')}"]]
         payload = snapshot_header + [header_row] + new_rows + [[""]]
         values = payload + existing
         self.clear(sheet_name, "A:Z")
         self.write_values(sheet_name, values, "A1")
-        print(f"✓ Prepended snapshot to '{sheet_name}': {len(new_rows)} new rows")
+        print(f"✓ Prepended snapshot to '{sheet_name}': {len(new_rows)} rows")
 
     def overwrite_with_snapshot(self, sheet_name: str, header_row, all_rows):
-        """
-        Overwrite the entire sheet with a single snapshot (full dataset).
-        """
-        snapshot_header = [[today_header_label()]]
+        snapshot_header = [[f"Snapshot for {datetime.now().strftime('%A - %Y-%m-%d')}"]]
         values = snapshot_header + [header_row] + all_rows + [[""]]
         self.clear(sheet_name, "A:Z")
         self.write_values(sheet_name, values, "A1")
-        print(f"✓ Wrote full snapshot to '{sheet_name}': {len(all_rows)} rows")
+        print(f"✓ Wrote full snapshot to '{sheet_name}' ({len(all_rows)} rows)")
 
-# ==============================
+# -----------------------------
+# Scrape helpers
+# -----------------------------
+def norm_text(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\s+", " ", s).strip()
+
+def extract_property_id_from_href(href: str) -> str:
+    try:
+        q = parse_qs(urlparse(href).query)
+        return q.get("PropertyId", [""])[0]
+    except Exception:
+        return ""
+
+# -----------------------------
 # Scraper
-# ==============================
+# -----------------------------
 class ForeclosureScraper:
-    def __init__(self, sheets: SheetsClient):
-        self.sheets = sheets
+    def __init__(self, sheets_client: SheetsClient):
+        self.sheets_client = sheets_client
 
     async def goto_with_retry(self, page, url: str, max_retries=MAX_RETRIES):
         last_exc = None
@@ -234,10 +226,8 @@ class ForeclosureScraper:
                 pass
 
     async def scrape_county_sales(self, page, county):
-        """Scrape one county's sales table (single page)."""
         url = f"{BASE_URL}Sales/SalesSearch?countyId={county['county_id']}"
         print(f"[INFO] Scraping {county['county_name']} -> {url}")
-
         for attempt in range(MAX_RETRIES):
             try:
                 await self.goto_with_retry(page, url)
@@ -251,7 +241,6 @@ class ForeclosureScraper:
                 rows = page.locator("table.table.table-striped tbody tr")
                 n = await rows.count()
                 results = []
-
                 for i in range(n):
                     row = rows.nth(i)
                     details_a = row.locator("td.hidden-print a")
@@ -267,7 +256,6 @@ class ForeclosureScraper:
                         defendant = norm_text(await row.locator("td").nth(4).inner_text())
                     except Exception:
                         defendant = ""
-                    # Address might shift; guard by td count
                     try:
                         tds = row.locator("td")
                         td_count = await tds.count()
@@ -279,16 +267,13 @@ class ForeclosureScraper:
                         prop_address = ""
 
                     approx_judgment = ""
-
-                    # Deep dive into details page for better address / fields
                     if details_url:
                         try:
                             await self.goto_with_retry(page, details_url)
                             await self.dismiss_banners(page)
                             await page.wait_for_selector(".sale-details-list", timeout=15000)
                             items = page.locator(".sale-details-list .sale-detail-item")
-                            items_count = await items.count()
-                            for j in range(items_count):
+                            for j in range(await items.count()):
                                 label = norm_text(await items.nth(j).locator(".sale-detail-label").inner_text())
                                 val = norm_text(await items.nth(j).locator(".sale-detail-value").inner_text())
                                 if ("Address" in label or "Property Address" in label):
@@ -309,17 +294,16 @@ class ForeclosureScraper:
                                     defendant = val
                                 elif "Sale Date" in label and not sales_date:
                                     sales_date = val
-
                         except Exception as e:
                             print(f"⚠ Details page error for {county['county_name']} (PropertyId={property_id}): {e}")
                         finally:
-                            # Go back to county list page
+                            # return to list page
                             try:
                                 await self.goto_with_retry(page, url)
                                 await self.dismiss_banners(page)
                                 await page.wait_for_selector("table.table.table-striped tbody tr, .no-sales, #noData", timeout=30000)
-                            except Exception as e:
-                                print(f"⚠ Failed to return to list page for {county['county_name']}: {e}")
+                            except Exception:
+                                pass
 
                     results.append({
                         "Property ID": property_id,
@@ -329,145 +313,115 @@ class ForeclosureScraper:
                         "Approx Judgment": approx_judgment,
                         "County": county['county_name'],
                     })
-
                 return results
             except Exception as e:
                 print(f"❌ Error scraping {county['county_name']} (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
                 await asyncio.sleep(2 ** attempt)
-
-        print(f"[FAIL] Could not get complete data for {county['county_name']} after {MAX_RETRIES} attempts.")
+        print(f"[FAIL] Could not get complete data for {county['county_name']}")
         return []
 
-# ==============================
-# Run Logic: First-Time vs Incremental
-# ==============================
+# -----------------------------
+# Orchestration
+# -----------------------------
 async def run():
     start_ts = datetime.now()
     print(f"▶ Starting scrape at {start_ts}")
 
-    # 1) Auth file
-    create_service_account_file()
-
-    # 2) Sheets client
     spreadsheet_id = os.environ.get("SPREADSHEET_ID")
     if not spreadsheet_id:
-        print("✗ SPREADSHEET_ID environment variable not set.")
+        print("✗ SPREADSHEET_ID env var is required.")
         sys.exit(1)
-    sheets = SheetsClient(spreadsheet_id)
 
-    # Determine FIRST RUN by presence of "All Data" sheet
+    # Initialize Sheets service
+    try:
+        service = init_sheets_service_from_env()
+        print("✓ Google Sheets API client initialized.")
+    except Exception as e:
+        print(f"✗ Error initializing Google Sheets client: {e}")
+        raise SystemExit(1)
+
+    sheets = SheetsClient(spreadsheet_id, service)
     ALL_DATA_SHEET = "All Data"
     first_run = not sheets.sheet_exists(ALL_DATA_SHEET)
     print(f"ℹ First run? {'YES' if first_run else 'NO'}")
 
-    all_data_rows = []  # rows: [Property ID, Address, Defendant, Sales Date, Approx Judgment, County]
+    all_data_rows = []
 
-    # 3) Playwright browser
     async with async_playwright() as p:
-        # In CI, Chromium is recommended; ensure browsers are installed in your pipeline beforehand.
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-
         scraper = ForeclosureScraper(sheets)
 
         for county in TARGET_COUNTIES:
-            county_tab = safe_sheet_title(county["county_name"])
+            county_tab = county["county_name"][:30]
             try:
-                print(f"—" * 60)
-                print(f"▶ County: {county['county_name']} (tab: {county_tab})")
-
-                # Scrape this county
                 county_records = await scraper.scrape_county_sales(page, county)
                 if not county_records:
-                    print(f"⚠ No data scraped for {county['county_name']}")
+                    print(f"⚠ No data for {county['county_name']}")
                     await asyncio.sleep(POLITE_DELAY_SECONDS)
                     continue
 
-                # Convert to DataFrame (consistent column order)
-                df_county = pd.DataFrame(
-                    county_records,
-                    columns=["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "County"]
-                )
+                df_county = pd.DataFrame(county_records, columns=["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "County"])
 
-                # Ensure county sheet exists (created later if needed)
-                # Decide behavior: full write vs incremental
                 if first_run or not sheets.sheet_exists(county_tab):
-                    # FULL SNAPSHOT WRITE for this county
                     sheets.create_sheet_if_missing(county_tab)
                     header = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment"]
-                    # County tab does NOT store the County column (to keep columns compact)
                     rows = df_county.drop(columns=["County"]).astype(str).values.tolist()
                     sheets.overwrite_with_snapshot(county_tab, header, rows)
                 else:
-                    # INCREMENTAL for this county: only new Property IDs
                     existing = sheets.get_values(county_tab, "A:Z")
-                    # Extract existing header + rows into DataFrame to get existing IDs
                     existing_ids = set()
                     if existing:
-                        # Find header row (first row after the "Snapshot for..." line)
-                        # existing looks like: [ ["Snapshot for..."], [header...], [rows...], [""], [maybe older snapshot header], ... ]
-                        # We'll scan for the first header line that matches our expected header.
                         header_idx = None
-                        for idx, row in enumerate(existing[:5]):  # search the top few lines
-                            if row and row[0].lower() in {"property id", "propertyid"}:
+                        for idx, row in enumerate(existing[:5]):
+                            if row and row[0].lower().replace(" ", "") in {"propertyid", "property id"}:
                                 header_idx = idx
                                 break
                         if header_idx is None:
-                            # fallback: try to find the most common header placement (second row)
                             header_idx = 1 if len(existing) > 1 else 0
-                        # Build set from all rows (skip snapshot headers and blanks)
                         for r in existing[header_idx + 1:]:
                             if not r or (len(r) == 1 and r[0].strip() == ""):
                                 continue
                             pid = (r[0] or "").strip()
                             if pid:
                                 existing_ids.add(pid)
-
                     new_df = df_county[~df_county["Property ID"].isin(existing_ids)].copy()
                     if new_df.empty:
-                        print(f"✓ No new rows for {county['county_name']}. Skipping write.")
+                        print(f"✓ No new rows for {county['county_name']}")
                     else:
                         header = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment"]
                         new_rows = new_df.drop(columns=["County"]).astype(str).values.tolist()
                         sheets.prepend_snapshot(county_tab, header, new_rows)
 
-                # Accumulate for All Data
                 all_data_rows.extend(df_county.astype(str).values.tolist())
-
                 print(f"✓ Completed {county['county_name']}: {len(df_county)} records")
                 await asyncio.sleep(POLITE_DELAY_SECONDS)
-
             except Exception as e:
                 print(f"❌ Failed county '{county['county_name']}': {e}")
-                # continue to next county
                 continue
 
         await browser.close()
 
-    # 4) Write "All Data"
+    # Update All Data sheet
     try:
         header_all = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "County"]
         if not all_data_rows:
-            print("⚠ No data scraped across all counties. 'All Data' not updated.")
+            print("⚠ No data scraped across all counties. Skipping 'All Data'.")
         else:
             sheets.create_sheet_if_missing(ALL_DATA_SHEET)
             if first_run:
-                # Full overwrite with snapshot
                 sheets.overwrite_with_snapshot(ALL_DATA_SHEET, header_all, all_data_rows)
             else:
-                # Incremental: dedupe against existing "All Data" by (County, Property ID)
                 existing = sheets.get_values(ALL_DATA_SHEET, "A:Z")
                 existing_pairs = set()
                 if existing:
-                    # Find first header row
                     header_idx = None
                     for idx, row in enumerate(existing[:5]):
-                        if row and row[0].lower() in {"property id", "propertyid"}:
+                        if row and row[0].lower().replace(" ", "") in {"propertyid", "property id"}:
                             header_idx = idx
                             break
                     if header_idx is None:
                         header_idx = 1 if len(existing) > 1 else 0
-
                     for r in existing[header_idx + 1:]:
                         if not r or (len(r) == 1 and r[0].strip() == ""):
                             continue
@@ -484,24 +438,18 @@ async def run():
                         new_rows.append(r)
 
                 if not new_rows:
-                    print("✓ No new rows for 'All Data'. Skipping write.")
+                    print("✓ No new rows for 'All Data'")
                 else:
                     sheets.prepend_snapshot(ALL_DATA_SHEET, header_all, new_rows)
                     print(f"✓ All Data updated: {len(new_rows)} new rows")
     except Exception as e:
         print(f"✗ Error updating 'All Data': {e}")
 
-    end_ts = datetime.now()
-    print(f"■ Finished scrape at {end_ts} (duration: {end_ts - start_ts})")
+    print("■ Finished at", datetime.now())
 
-# ==============================
-# Entrypoint
-# ==============================
 if __name__ == "__main__":
     try:
         asyncio.run(run())
-    except KeyboardInterrupt:
-        print("Interrupted by user.")
     except Exception as e:
-        print(f"Fatal error: {e}")
+        print("Fatal error:", e)
         sys.exit(1)
