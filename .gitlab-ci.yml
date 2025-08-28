@@ -34,7 +34,7 @@ test_credentials:
 
 scrape_foreclosures:
   stage: scrape
-  image: mcr.microsoft.com/playwright/python:v1.48.0-jammy
+  image: mcr.microsoft.com/playwright/python:v1.54.0-jammy
   before_script:
     - pip install --upgrade pip
     - pip install -r requirements.txt

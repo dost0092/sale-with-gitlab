@@ -1,6 +1,6 @@
-pandas
-google-api-python-client
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-playwright
+playwright==1.54.0
+pandas>=2.0
+google-api-python-client>=2.70
+google-auth>=2.20
+google-auth-httplib2>=0.1.0
+google-auth-oauthlib>=1.0.0
