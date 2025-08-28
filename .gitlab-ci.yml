@@ -1,14 +1,14 @@
 image: python:3.9
 
+stages:
+  - run
+
 before_script:
-  - python -m venv venv
-  - source venv/bin/activate
+  - python --version
+  - pip install --upgrade pip
   - pip install -r requirements.txt
 
-stages:
-  - scrape
-
-scrape_job:
-  stage: scrape
+scrape_and_update:
+  stage: run
   script:
-    - python main.py
+    - python scrape_and_update.py
