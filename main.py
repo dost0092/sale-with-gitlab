@@ -32,14 +32,16 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 # -----------------------------
 BASE_URL = "https://salesweb.civilview.com/"
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
 TARGET_COUNTIES = [
     {"county_id": "52", "county_name": "Cape May County, NJ"},
-    {"county_id": "1",  "county_name": "Camden County, NJ"},
-    {"county_id": "3",  "county_name": "Burlington County, NJ"},
-    {"county_id": "6",  "county_name": "Cumberland County, NJ"},
+    {"county_id": "25", "county_name": "Atlantic County, NJ"},
+    {"county_id": "1", "county_name": "Camden County, NJ"},
+    {"county_id": "3", "county_name": "Burlington County, NJ"},
+    {"county_id": "6", "county_name": "Cumberland County, NJ"},
     {"county_id": "19", "county_name": "Gloucester County, NJ"},
     {"county_id": "20", "county_name": "Salem County, NJ"},
-    {"county_id": "15", "county_name": "Union County, NJ"},
+    {"county_id": "15", "county_name": "Union County, NJ"}
 ]
 
 POLITE_DELAY_SECONDS = 1.5
