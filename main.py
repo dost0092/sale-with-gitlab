@@ -138,7 +138,6 @@ class SheetsClient:
             res = self.svc.values().get(spreadsheetId=self.spreadsheet_id, range=f"'{sheet_name}'!{rng}").execute()
             return res.get("values", [])
         except HttpError as e:
-            # return empty if sheet missing
             return []
 
     def clear(self, sheet_name: str, rng: str = "A:Z"):
@@ -155,19 +154,62 @@ class SheetsClient:
                 valueInputOption="USER_ENTERED",
                 body={"values": values}
             ).execute()
+
+            # --- Beautify: bold header, freeze row, auto resize ---
+            self.svc.batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={
+                    "requests": [
+                        {"repeatCell": {
+                            "range": {
+                                "sheetId": self._get_sheet_id(sheet_name),
+                                "startRowIndex": 1,
+                                "endRowIndex": 2
+                            },
+                            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                            "fields": "userEnteredFormat.textFormat.bold"
+                        }},
+                        {"updateSheetProperties": {
+                            "properties": {"sheetId": self._get_sheet_id(sheet_name),
+                                           "gridProperties": {"frozenRowCount": 2}},
+                            "fields": "gridProperties.frozenRowCount"
+                        }},
+                        {"autoResizeDimensions": {
+                            "dimensions": {
+                                "sheetId": self._get_sheet_id(sheet_name),
+                                "dimension": "COLUMNS",
+                                "startIndex": 0,
+                                "endIndex": len(values[0]) if values else 10
+                            }
+                        }}
+                    ]
+                }
+            ).execute()
         except HttpError as e:
             print(f"✗ write_values error on '{sheet_name}': {e}")
             raise
 
+    def _get_sheet_id(self, sheet_name: str):
+        info = self.spreadsheet_info()
+        for s in info.get('sheets', []):
+            if s['properties']['title'] == sheet_name:
+                return s['properties']['sheetId']
+        return None
+
+    # --- changed: only prepend *new* snapshot rows ---
     def prepend_snapshot(self, sheet_name: str, header_row, new_rows):
-        existing = self.get_values(sheet_name, "A:Z")
+        if not new_rows:
+            print(f"✓ No new rows to prepend in '{sheet_name}'")
+            return
         snapshot_header = [[f"Snapshot for {datetime.now().strftime('%A - %Y-%m-%d')}"]]
         payload = snapshot_header + [header_row] + new_rows + [[""]]
+        existing = self.get_values(sheet_name, "A:Z")
         values = payload + existing
         self.clear(sheet_name, "A:Z")
         self.write_values(sheet_name, values, "A1")
-        print(f"✓ Prepended snapshot to '{sheet_name}': {len(new_rows)} rows")
+        print(f"✓ Prepended snapshot to '{sheet_name}': {len(new_rows)} new rows")
 
+    # first run = full overwrite
     def overwrite_with_snapshot(self, sheet_name: str, header_row, all_rows):
         snapshot_header = [[f"Snapshot for {datetime.now().strftime('%A - %Y-%m-%d')}"]]
         values = snapshot_header + [header_row] + all_rows + [[""]]
