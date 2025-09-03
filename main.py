@@ -45,6 +45,7 @@ TARGET_COUNTIES = [
     {"county_id": "7", "county_name": "Bergen County, NJ"},
     {"county_id": "2", "county_name": "Essex County, NJ"},
     {"county_id": "23", "county_name": "Montgomery County, PA"},
+    {"county_id": "24", "county_name": "New Castle County, DE"},
 ]
 
 POLITE_DELAY_SECONDS = 1.5
@@ -328,6 +329,7 @@ class ForeclosureScraper:
                     defendant = await safe_text("defendant")
                     prop_address = await safe_text("address")
                     approx_judgment = ""
+                    sale_type = ""   # <-- add field
 
                     if details_url:
                         try:
@@ -357,6 +359,11 @@ class ForeclosureScraper:
                                     defendant = val
                                 elif "sale" in label_low and "date" in label_low and not sales_date:
                                     sales_date = val
+                                # -------------------------------
+                                # Special handling: New Castle County
+                                # -------------------------------
+                                elif county["county_id"] == "24" and "sale type" in label_low:
+                                    sale_type = val
                         except Exception as e:
                             print(f"⚠ Details page error for {county['county_name']} (PropertyId={property_id}): {e}")
                         finally:
@@ -367,14 +374,19 @@ class ForeclosureScraper:
                             except Exception:
                                 pass
 
-                    results.append({
+                    # include sale_type only if county_id = 24
+                    row_data = {
                         "Property ID": property_id,
                         "Address": prop_address,
                         "Defendant": defendant,
                         "Sales Date": sales_date,
                         "Approx Judgment": approx_judgment,
                         "County": county['county_name'],
-                    })
+                    }
+                    if county["county_id"] == "24":
+                        row_data["Sale Type"] = sale_type   # <-- add column dynamically
+
+                    results.append(row_data)
 
                 return results
 
