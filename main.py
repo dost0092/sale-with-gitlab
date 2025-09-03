@@ -45,7 +45,6 @@ TARGET_COUNTIES = [
     {"county_id": "7", "county_name": "Bergen County, NJ"},
     {"county_id": "2", "county_name": "Essex County, NJ"},
     {"county_id": "23", "county_name": "Montgomery County, PA"},
-    {"county_id": "24", "county_name": "New Castle County, DE"},
 ]
 
 POLITE_DELAY_SECONDS = 1.5
@@ -240,10 +239,10 @@ def extract_property_id_from_href(href: str) -> str:
 # Scraper
 # -----------------------------
 class ForeclosureScraper:
-    def __init__(self, sheets_client):
+    def __init__(self, sheets_client: SheetsClient):
         self.sheets_client = sheets_client
 
-    async def goto_with_retry(self, page, url: str, max_retries=3):
+    async def goto_with_retry(self, page, url: str, max_retries=MAX_RETRIES):
         last_exc = None
         for attempt in range(max_retries):
             try:
@@ -274,142 +273,79 @@ class ForeclosureScraper:
                 pass
 
     async def scrape_county_sales(self, page, county):
-        """Main scraping function that handles different table structures dynamically."""
         url = f"{BASE_URL}Sales/SalesSearch?countyId={county['county_id']}"
         print(f"[INFO] Scraping {county['county_name']} -> {url}")
-
         for attempt in range(MAX_RETRIES):
             try:
                 await self.goto_with_retry(page, url)
                 await self.dismiss_banners(page)
-
                 try:
                     await page.wait_for_selector("table.table.table-striped tbody tr, .no-sales, #noData", timeout=30000)
-                except Exception:
+                except PlaywrightTimeoutError:
                     print(f"[WARN] No sales found for {county['county_name']}")
-                    return []
-
-                # Build column mapping from headers - handles Township and other variations
-                header_ths = page.locator("table.table.table-striped thead tr th")
-                if await header_ths.count() == 0:
-                    header_ths = page.locator("table.table.table-striped tr").first.locator("th")
-
-                colmap = {}
-                header_count = await header_ths.count()
-                
-                for i in range(header_count):
-                    try:
-                        htxt = (await header_ths.nth(i).inner_text()).strip().lower()
-                        if "sale" in htxt and "date" in htxt:
-                            colmap["sales_date"] = i
-                        elif "defendant" in htxt:
-                            colmap["defendant"] = i
-                        elif "address" in htxt:
-                            colmap["address"] = i
-                    except Exception:
-                        continue
-
-                if not colmap:
-                    print(f"[WARN] Could not determine table structure for {county['county_name']}")
                     return []
 
                 rows = page.locator("table.table.table-striped tbody tr")
                 n = await rows.count()
                 results = []
-
                 for i in range(n):
                     row = rows.nth(i)
-                    
-                    # Get property details link
                     details_a = row.locator("td.hidden-print a")
                     details_href = (await details_a.get_attribute("href")) or ""
                     details_url = details_href if details_href.startswith("http") else urljoin(BASE_URL, details_href)
                     property_id = extract_property_id_from_href(details_href)
 
-                    # Extract data from table cells using dynamic column mapping
-                    sales_date = ""
-                    defendant = ""
-                    prop_address = ""
-                    
-                    # Get sales date
-                    if "sales_date" in colmap:
-                        try:
-                            sales_date_raw = await row.locator("td").nth(colmap["sales_date"]).inner_text()
-                            sales_date = re.sub(r"\s+", " ", sales_date_raw).strip()
-                        except Exception:
-                            sales_date = ""
-                    
-                    # Get defendant
-                    if "defendant" in colmap:
-                        try:
-                            defendant_raw = await row.locator("td").nth(colmap["defendant"]).inner_text()
-                            defendant = re.sub(r"\s+", " ", defendant_raw).strip()
-                        except Exception:
-                            defendant = ""
-                    
-                    # Get address
-                    if "address" in colmap:
-                        try:
-                            address_raw = await row.locator("td").nth(colmap["address"]).inner_text()
-                            prop_address = re.sub(r"\s+", " ", address_raw).strip()
-                        except Exception:
+                    try:
+                        sales_date = norm_text(await row.locator("td").nth(2).inner_text())
+                    except Exception:
+                        sales_date = ""
+                    try:
+                        defendant = norm_text(await row.locator("td").nth(4).inner_text())
+                    except Exception:
+                        defendant = ""
+                    try:
+                        tds = row.locator("td")
+                        td_count = await tds.count()
+                        if td_count >= 6:
+                            prop_address = norm_text(await tds.nth(5).inner_text())
+                        else:
                             prop_address = ""
+                    except Exception:
+                        prop_address = ""
 
                     approx_judgment = ""
-                    sale_type = ""
-
-                    # Get additional data from details page
                     if details_url:
                         try:
                             await self.goto_with_retry(page, details_url)
                             await self.dismiss_banners(page)
                             await page.wait_for_selector(".sale-details-list", timeout=15000)
-                            
                             items = page.locator(".sale-details-list .sale-detail-item")
-                            item_count = await items.count()
-                            
-                            for j in range(item_count):
-                                try:
-                                    label_elem = items.nth(j).locator(".sale-detail-label")
-                                    value_elem = items.nth(j).locator(".sale-detail-value")
-                                    
-                                    label = (await label_elem.inner_text()).strip()
-                                    val = (await value_elem.inner_text()).strip()
-                                    label_low = label.lower()
-                                    
-                                    if "address" in label_low:
-                                        try:
-                                            val_html = await value_elem.inner_html()
-                                            val_html = re.sub(r"<br\s*/?>", " ", val_html)
-                                            val_clean = re.sub(r"<.*?>", "", val_html).strip()
-                                            if not prop_address or len(val_clean) > len(prop_address):
-                                                prop_address = val_clean
-                                        except Exception:
-                                            if not prop_address:
-                                                prop_address = val
-                                                
-                                    elif ("Approx. Judgment" in label or "Approx. Upset" in label
-                                        or "Approximate Judgment:" in label or "Approx Judgment*" in label 
-                                        or "Approx. Upset*" in label or "Debt Amount" in label):
-                                        approx_judgment = val
-                                        
-                                    elif "defendant" in label_low and not defendant:
-                                        defendant = val
-                                        
-                                    elif "sale" in label_low and "date" in label_low and not sales_date:
-                                        sales_date = val
-                                        
-                                    # Special handling: New Castle County (county_id = "24")
-                                    elif county["county_id"] == "24" and "sale type" in label_low:
-                                        sale_type = val
-                                        
-                                except Exception:
-                                    continue
-                                    
+                            for j in range(await items.count()):
+                                label = norm_text(await items.nth(j).locator(".sale-detail-label").inner_text())
+                                val = norm_text(await items.nth(j).locator(".sale-detail-value").inner_text())
+                                if ("Address" in label or "Property Address" in label):
+                                    try:
+                                        val_html = await items.nth(j).locator(".sale-detail-value").inner_html()
+                                        val_html = re.sub(r"<br\s*/?>", " ", val_html)
+                                        val_clean = re.sub(r"<.*?>", "", val_html).strip()
+                                        details_address = norm_text(val_clean)
+                                        if not prop_address or len(details_address) > len(prop_address):
+                                            prop_address = details_address
+                                    except Exception:
+                                        if not prop_address:
+                                            prop_address = norm_text(val)
+                                elif ("Approx. Judgment" in label or "Approx. Upset" in label
+                                      or "Approximate Judgment:" in label or "Approx Judgment*" in label or "Approx. Upset*" in label 
+                                      or "Debt Amount" in label):
+                                    approx_judgment = val
+                                elif "Defendant" in label and not defendant:
+                                    defendant = val
+                                elif "Sale Date" in label and not sales_date:
+                                    sales_date = val
                         except Exception as e:
-                            print(f"⚠ Details page error for {county['county_name']}: {e}")
+                            print(f"⚠ Details page error for {county['county_name']} (PropertyId={property_id}): {e}")
                         finally:
-                            # Return to list page
+                            # return to list page
                             try:
                                 await self.goto_with_retry(page, url)
                                 await self.dismiss_banners(page)
@@ -417,35 +353,24 @@ class ForeclosureScraper:
                             except Exception:
                                 pass
 
-                    # Build result row
-                    row_data = {
+                    results.append({
                         "Property ID": property_id,
                         "Address": prop_address,
                         "Defendant": defendant,
                         "Sales Date": sales_date,
                         "Approx Judgment": approx_judgment,
                         "County": county['county_name'],
-                    }
-                    
-                    # Add Sale Type column only for New Castle County (county_id = "24")
-                    if county["county_id"] == "24":
-                        row_data["Sale Type"] = sale_type
-
-                    results.append(row_data)
-
+                    })
                 return results
-
             except Exception as e:
                 print(f"❌ Error scraping {county['county_name']} (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
                 await asyncio.sleep(2 ** attempt)
-
         print(f"[FAIL] Could not get complete data for {county['county_name']}")
         return []
 
 # -----------------------------
 # Orchestration
 # -----------------------------
-
 async def run():
     start_ts = datetime.now()
     print(f"▶ Starting scrape at {start_ts}")
@@ -484,18 +409,13 @@ async def run():
                     await asyncio.sleep(POLITE_DELAY_SECONDS)
                     continue
 
-                df_county = pd.DataFrame(county_records)
-                
-                # ✅ DYNAMIC HEADERS - Get actual columns from the data
-                county_columns = [col for col in df_county.columns if col != "County"]
-                county_header = county_columns  # This will include "Sale Type" for county 24
-                
-                print(f"[INFO] {county['county_name']} columns: {county_header}")
+                df_county = pd.DataFrame(county_records, columns=["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "County"])
 
                 if first_run or not sheets.sheet_exists(county_tab):
                     sheets.create_sheet_if_missing(county_tab)
+                    header = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment"]
                     rows = df_county.drop(columns=["County"]).astype(str).values.tolist()
-                    sheets.overwrite_with_snapshot(county_tab, county_header, rows)
+                    sheets.overwrite_with_snapshot(county_tab, header, rows)
                 else:
                     existing = sheets.get_values(county_tab, "A:Z")
                     existing_ids = set()
@@ -513,29 +433,13 @@ async def run():
                             pid = (r[0] or "").strip()
                             if pid:
                                 existing_ids.add(pid)
-                    
                     new_df = df_county[~df_county["Property ID"].isin(existing_ids)].copy()
                     if new_df.empty:
                         print(f"✓ No new rows for {county['county_name']}")
                     else:
+                        header = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment"]
                         new_rows = new_df.drop(columns=["County"]).astype(str).values.tolist()
-                        
-                        # ✅ Check if sheet structure needs updating for new columns
-                        existing_header = existing[0] if existing else []
-                        if set(county_header) != set(existing_header):
-                            print(f"[INFO] Updating {county_tab} sheet structure for new columns")
-                            # Get all existing data
-                            all_existing_data = []
-                            if existing and len(existing) > 1:
-                                for r in existing[1:]:
-                                    if r and not (len(r) == 1 and r[0].strip() == ""):
-                                        all_existing_data.append(r)
-                            
-                            # Combine with new data and recreate sheet
-                            combined_data = all_existing_data + new_rows
-                            sheets.overwrite_with_snapshot(county_tab, county_header, combined_data)
-                        else:
-                            sheets.prepend_snapshot(county_tab, county_header, new_rows)
+                        sheets.prepend_snapshot(county_tab, header, new_rows)
 
                 all_data_rows.extend(df_county.astype(str).values.tolist())
                 print(f"✓ Completed {county['county_name']}: {len(df_county)} records")
@@ -546,47 +450,12 @@ async def run():
 
         await browser.close()
 
-    # ✅ Update All Data sheet with DYNAMIC headers
+    # Update All Data sheet
     try:
+        header_all = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "County"]
         if not all_data_rows:
             print("⚠ No data scraped across all counties. Skipping 'All Data'.")
         else:
-            # Determine all possible columns across all counties
-            all_columns = set()
-            for row_data in all_data_rows:
-                # Reconstruct the original dict to get column names
-                # This is a bit tricky since we have list data, but we know the standard structure
-                pass
-            
-            # ✅ BETTER APPROACH: Build All Data from the DataFrames directly
-            all_county_dfs = []
-            
-            # Re-scrape to get proper DataFrames (or store them during the loop above)
-            # For now, let's use a standard approach with all possible columns
-            
-            # Standard columns that all counties have
-            standard_cols = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "County"]
-            
-            # Check if we have New Castle County data (county_id = "24")
-            has_new_castle = any(county["county_id"] == "24" for county in TARGET_COUNTIES)
-            
-            if has_new_castle:
-                # Include Sale Type column for New Castle County
-                header_all = ["Property ID", "Address", "Defendant", "Sales Date", "Approx Judgment", "Sale Type", "County"]
-                
-                # Pad rows that don't have Sale Type with empty string
-                padded_rows = []
-                for row in all_data_rows:
-                    if len(row) == 6:  # Standard row without Sale Type
-                        # Insert empty Sale Type before County
-                        padded_row = row[:5] + [""] + [row[5]]
-                        padded_rows.append(padded_row)
-                    else:
-                        padded_rows.append(row)
-                all_data_rows = padded_rows
-            else:
-                header_all = standard_cols
-            
             sheets.create_sheet_if_missing(ALL_DATA_SHEET)
             if first_run:
                 sheets.overwrite_with_snapshot(ALL_DATA_SHEET, header_all, all_data_rows)
@@ -605,38 +474,21 @@ async def run():
                         if not r or (len(r) == 1 and r[0].strip() == ""):
                             continue
                         pid = (r[0] if len(r) > 0 else "").strip()
-                        # Adjust county column index based on whether Sale Type exists
-                        county_col_idx = 6 if has_new_castle else 5
-                        cty = (r[county_col_idx] if len(r) > county_col_idx else "").strip()
+                        cty = (r[5] if len(r) > 5 else "").strip()
                         if pid and cty:
                             existing_pairs.add((cty, pid))
 
                 new_rows = []
                 for r in all_data_rows:
                     pid = (r[0] if len(r) > 0 else "").strip()
-                    county_col_idx = 6 if has_new_castle else 5
-                    cty = (r[county_col_idx] if len(r) > county_col_idx else "").strip()
+                    cty = (r[5] if len(r) > 5 else "").strip()
                     if pid and cty and (cty, pid) not in existing_pairs:
                         new_rows.append(r)
 
                 if not new_rows:
                     print("✓ No new rows for 'All Data'")
                 else:
-                    # Check if All Data sheet structure needs updating
-                    existing_header = existing[0] if existing else []
-                    if set(header_all) != set(existing_header):
-                        print("[INFO] Updating All Data sheet structure for new columns")
-                        # Recreate the sheet with new structure
-                        all_existing_data = []
-                        if existing and len(existing) > 1:
-                            for r in existing[1:]:
-                                if r and not (len(r) == 1 and r[0].strip() == ""):
-                                    all_existing_data.append(r)
-                        
-                        combined_data = all_existing_data + new_rows
-                        sheets.overwrite_with_snapshot(ALL_DATA_SHEET, header_all, combined_data)
-                    else:
-                        sheets.prepend_snapshot(ALL_DATA_SHEET, header_all, new_rows)
+                    sheets.prepend_snapshot(ALL_DATA_SHEET, header_all, new_rows)
                     print(f"✓ All Data updated: {len(new_rows)} new rows")
     except Exception as e:
         print(f"✗ Error updating 'All Data': {e}")
@@ -649,6 +501,8 @@ if __name__ == "__main__":
     except Exception as e:
         print("Fatal error:", e)
         sys.exit(1)
+
+
 
 
 
