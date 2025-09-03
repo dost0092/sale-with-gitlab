@@ -273,127 +273,195 @@ class ForeclosureScraper:
             except Exception:
                 pass
 
+    async def get_table_columns(self, page, table):
+        """Get column mapping based on headers to handle different table structures."""
+        try:
+            # Try thead first, fallback to first row with th
+            headers = table.locator("thead tr th")
+            if await headers.count() == 0:
+                headers = table.locator("tr").filter(has=page.locator("th")).first.locator("th")
+            
+            colmap = {}
+            count = await headers.count()
+            
+            for i in range(count):
+                try:
+                    header_text = (await headers.nth(i).inner_text()).strip().lower()
+                    header_text = re.sub(r'[:\s]+', ' ', header_text).strip()
+                    
+                    if 'address' in header_text:
+                        colmap['address'] = i
+                    elif 'defendant' in header_text:
+                        colmap['defendant'] = i
+                    elif 'sale' in header_text and 'date' in header_text:
+                        colmap['sales_date'] = i
+                    elif 'plaintiff' in header_text:
+                        colmap['plaintiff'] = i
+                    elif 'township' in header_text:
+                        colmap['township'] = i
+                        
+                except Exception:
+                    continue
+                    
+            return colmap
+        except Exception as e:
+            print(f"[ERROR] Failed to get column mapping: {e}")
+            return {}
+
+    async def get_cell_data(self, row, col_index):
+        """Safely extract text from table cell, handling HTML content."""
+        if col_index is None:
+            return ""
+        try:
+            # Try to get HTML first for better address formatting
+            html_content = await row.locator("td").nth(col_index).inner_html()
+            # Clean HTML: replace <br> with spaces, remove other tags
+            clean_text = re.sub(r"<br\s*/?>", " ", html_content, flags=re.I)
+            clean_text = re.sub(r"<.*?>", "", clean_text)
+            return re.sub(r'\s+', ' ', clean_text).strip()
+        except Exception:
+            try:
+                # Fallback to plain text
+                text = await row.locator("td").nth(col_index).inner_text()
+                return re.sub(r'\s+', ' ', text).strip()
+            except Exception:
+                return ""
+
+    async def get_details_data(self, page, details_url, list_url, missing_fields):
+        """Extract additional data from details page if needed."""
+        if not details_url or not missing_fields:
+            return {}
+            
+        extracted = {}
+        try:
+            await self.goto_with_retry(page, details_url)
+            await self.dismiss_banners(page)
+            await page.wait_for_selector(".sale-details-list", timeout=15000)
+            
+            items = page.locator(".sale-details-list .sale-detail-item")
+            for i in range(await items.count()):
+                try:
+                    label = (await items.nth(i).locator(".sale-detail-label").inner_text()).strip().lower()
+                    value_el = items.nth(i).locator(".sale-detail-value")
+                    value = (await value_el.inner_text()).strip()
+                    
+                    if 'address' in label and 'address' in missing_fields:
+                        try:
+                            # Try to get HTML version for better formatting
+                            html_val = await value_el.inner_html()
+                            html_val = re.sub(r"<br\s*/?>", " ", html_val, flags=re.I)
+                            extracted['address'] = re.sub(r"<.*?>", "", html_val).strip()
+                        except Exception:
+                            extracted['address'] = value
+                            
+                    elif ('approx' in label and ('judgment' in label or 'upset' in label)) or 'debt amount' in label:
+                        if 'approx_judgment' in missing_fields:
+                            extracted['approx_judgment'] = value
+                            
+                    elif 'defendant' in label and 'defendant' in missing_fields:
+                        extracted['defendant'] = value
+                        
+                    elif 'sale' in label and 'date' in label and 'sales_date' in missing_fields:
+                        extracted['sales_date'] = value
+                        
+                except Exception:
+                    continue
+                    
+        except Exception as e:
+            print(f"⚠ Details page error: {e}")
+        finally:
+            # Return to list page
+            try:
+                await self.goto_with_retry(page, list_url)
+                await self.dismiss_banners(page)
+                await page.wait_for_selector("table.table.table-striped tbody tr, .no-sales, #noData", timeout=30000)
+            except Exception:
+                pass
+                
+        return extracted
+
     async def scrape_county_sales(self, page, county):
+        """Main scraping function that handles different table structures dynamically."""
         url = f"{BASE_URL}Sales/SalesSearch?countyId={county['county_id']}"
         print(f"[INFO] Scraping {county['county_name']} -> {url}")
-
+        
         for attempt in range(MAX_RETRIES):
             try:
                 await self.goto_with_retry(page, url)
                 await self.dismiss_banners(page)
-
+                
                 try:
                     await page.wait_for_selector("table.table.table-striped tbody tr, .no-sales, #noData", timeout=30000)
                 except PlaywrightTimeoutError:
                     print(f"[WARN] No sales found for {county['county_name']}")
                     return []
 
-                # build column map from headers
-                header_ths = page.locator("table.table.table-striped thead tr th")
-                if await header_ths.count() == 0:
-                    header_ths = page.locator("table.table.table-striped tr").first.locator("th")
+                table = page.locator("table.table.table-striped").first
+                
+                # Get dynamic column mapping - handles Township column and other variations
+                colmap = await self.get_table_columns(page, table)
+                if not colmap:
+                    print(f"[WARN] Could not determine table structure for {county['county_name']}")
+                    return []
 
-                colmap = {}
-                for i in range(await header_ths.count()):
-                    htxt = (await header_ths.nth(i).inner_text()).strip().lower()
-                    if "sale" in htxt and "date" in htxt:
-                        colmap["sales_date"] = i
-                    elif "defendant" in htxt:
-                        colmap["defendant"] = i
-                    elif "address" in htxt:
-                        colmap["address"] = i
-
-                rows = page.locator("table.table.table-striped tbody tr")
-                n = await rows.count()
+                rows = table.locator("tbody tr")
                 results = []
-
-                for i in range(n):
+                
+                for i in range(await rows.count()):
                     row = rows.nth(i)
+                    
+                    # Get property link and ID
                     details_a = row.locator("td.hidden-print a")
                     details_href = (await details_a.get_attribute("href")) or ""
                     details_url = details_href if details_href.startswith("http") else urljoin(BASE_URL, details_href)
                     property_id = extract_property_id_from_href(details_href)
-
-                    # get values by column name, not fixed position
-                    def safe_text(colname):
-                        try:
-                            idx = colmap.get(colname)
-                            if idx is None:
-                                return ""
-                            txt = await row.locator("td").nth(idx).inner_text()
-                            return re.sub(r"\s+", " ", txt).strip()
-                        except Exception:
-                            return ""
-
-                    sales_date = await safe_text("sales_date")
-                    defendant = await safe_text("defendant")
-                    prop_address = await safe_text("address")
+                    
+                    # Extract data using dynamic column positions
+                    sales_date = await self.get_cell_data(row, colmap.get('sales_date'))
+                    defendant = await self.get_cell_data(row, colmap.get('defendant'))
+                    prop_address = await self.get_cell_data(row, colmap.get('address'))
                     approx_judgment = ""
-                    sale_type = ""   # <-- add field
-
-                    if details_url:
-                        try:
-                            await self.goto_with_retry(page, details_url)
-                            await self.dismiss_banners(page)
-                            await page.wait_for_selector(".sale-details-list", timeout=15000)
-                            items = page.locator(".sale-details-list .sale-detail-item")
-                            for j in range(await items.count()):
-                                label = (await items.nth(j).locator(".sale-detail-label").inner_text()).strip()
-                                val = (await items.nth(j).locator(".sale-detail-value").inner_text()).strip()
-                                label_low = label.lower()
-                                if "address" in label_low:
-                                    try:
-                                        val_html = await items.nth(j).locator(".sale-detail-value").inner_html()
-                                        val_html = re.sub(r"<br\s*/?>", " ", val_html)
-                                        val_clean = re.sub(r"<.*?>", "", val_html).strip()
-                                        if not prop_address or len(val_clean) > len(prop_address):
-                                            prop_address = val_clean
-                                    except Exception:
-                                        if not prop_address:
-                                            prop_address = val
-                                elif ("Approx. Judgment" in label or "Approx. Upset" in label
-                                    or "Approximate Judgment:" in label or "Approx Judgment*" in label 
-                                    or "Approx. Upset*" in label or "Debt Amount" in label):
-                                    approx_judgment = val
-                                elif "defendant" in label_low and not defendant:
-                                    defendant = val
-                                elif "sale" in label_low and "date" in label_low and not sales_date:
-                                    sales_date = val
-                                # -------------------------------
-                                # Special handling: New Castle County
-                                # -------------------------------
-                                elif county["county_id"] == "24" and "sale type" in label_low:
-                                    sale_type = val
-                        except Exception as e:
-                            print(f"⚠ Details page error for {county['county_name']} (PropertyId={property_id}): {e}")
-                        finally:
-                            try:
-                                await self.goto_with_retry(page, url)
-                                await self.dismiss_banners(page)
-                                await page.wait_for_selector("table.table.table-striped tbody tr, .no-sales, #noData", timeout=30000)
-                            except Exception:
-                                pass
-
-                    # include sale_type only if county_id = 24
-                    row_data = {
+                    
+                    # Determine what data we still need from details page
+                    missing_fields = set()
+                    if not prop_address:
+                        missing_fields.add('address')
+                    if not sales_date:
+                        missing_fields.add('sales_date')
+                    if not defendant:
+                        missing_fields.add('defendant')
+                    missing_fields.add('approx_judgment')  # Usually only in details
+                    
+                    # Get additional data from details if needed
+                    if details_url and missing_fields:
+                        details_data = await self.get_details_data(page, details_url, url, missing_fields)
+                        
+                        # Use better data from details if available
+                        if 'address' in details_data:
+                            if not prop_address or len(details_data['address']) > len(prop_address):
+                                prop_address = details_data['address']
+                        if 'sales_date' in details_data and not sales_date:
+                            sales_date = details_data['sales_date']
+                        if 'defendant' in details_data and not defendant:
+                            defendant = details_data['defendant']
+                        if 'approx_judgment' in details_data:
+                            approx_judgment = details_data['approx_judgment']
+                    
+                    results.append({
                         "Property ID": property_id,
                         "Address": prop_address,
                         "Defendant": defendant,
                         "Sales Date": sales_date,
                         "Approx Judgment": approx_judgment,
                         "County": county['county_name'],
-                    }
-                    if county["county_id"] == "24":
-                        row_data["Sale Type"] = sale_type   # <-- add column dynamically
-
-                    results.append(row_data)
-
+                    })
+                
                 return results
-
+                
             except Exception as e:
                 print(f"❌ Error scraping {county['county_name']} (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
                 await asyncio.sleep(2 ** attempt)
-
+        
         print(f"[FAIL] Could not get complete data for {county['county_name']}")
         return []
 # -----------------------------
