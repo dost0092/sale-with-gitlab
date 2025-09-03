@@ -275,19 +275,37 @@ class ForeclosureScraper:
     async def scrape_county_sales(self, page, county):
         url = f"{BASE_URL}Sales/SalesSearch?countyId={county['county_id']}"
         print(f"[INFO] Scraping {county['county_name']} -> {url}")
+
         for attempt in range(MAX_RETRIES):
             try:
                 await self.goto_with_retry(page, url)
                 await self.dismiss_banners(page)
+
                 try:
                     await page.wait_for_selector("table.table.table-striped tbody tr, .no-sales, #noData", timeout=30000)
                 except PlaywrightTimeoutError:
                     print(f"[WARN] No sales found for {county['county_name']}")
                     return []
 
+                # build column map from headers
+                header_ths = page.locator("table.table.table-striped thead tr th")
+                if await header_ths.count() == 0:
+                    header_ths = page.locator("table.table.table-striped tr").first.locator("th")
+
+                colmap = {}
+                for i in range(await header_ths.count()):
+                    htxt = (await header_ths.nth(i).inner_text()).strip().lower()
+                    if "sale" in htxt and "date" in htxt:
+                        colmap["sales_date"] = i
+                    elif "defendant" in htxt:
+                        colmap["defendant"] = i
+                    elif "address" in htxt:
+                        colmap["address"] = i
+
                 rows = page.locator("table.table.table-striped tbody tr")
                 n = await rows.count()
                 results = []
+
                 for i in range(n):
                     row = rows.nth(i)
                     details_a = row.locator("td.hidden-print a")
@@ -295,25 +313,22 @@ class ForeclosureScraper:
                     details_url = details_href if details_href.startswith("http") else urljoin(BASE_URL, details_href)
                     property_id = extract_property_id_from_href(details_href)
 
-                    try:
-                        sales_date = norm_text(await row.locator("td").nth(2).inner_text())
-                    except Exception:
-                        sales_date = ""
-                    try:
-                        defendant = norm_text(await row.locator("td").nth(4).inner_text())
-                    except Exception:
-                        defendant = ""
-                    try:
-                        tds = row.locator("td")
-                        td_count = await tds.count()
-                        if td_count >= 6:
-                            prop_address = norm_text(await tds.nth(5).inner_text())
-                        else:
-                            prop_address = ""
-                    except Exception:
-                        prop_address = ""
+                    # get values by column name, not fixed position
+                    def safe_text(colname):
+                        try:
+                            idx = colmap.get(colname)
+                            if idx is None:
+                                return ""
+                            txt = await row.locator("td").nth(idx).inner_text()
+                            return re.sub(r"\s+", " ", txt).strip()
+                        except Exception:
+                            return ""
 
+                    sales_date = await safe_text("sales_date")
+                    defendant = await safe_text("defendant")
+                    prop_address = await safe_text("address")
                     approx_judgment = ""
+
                     if details_url:
                         try:
                             await self.goto_with_retry(page, details_url)
@@ -321,31 +336,30 @@ class ForeclosureScraper:
                             await page.wait_for_selector(".sale-details-list", timeout=15000)
                             items = page.locator(".sale-details-list .sale-detail-item")
                             for j in range(await items.count()):
-                                label = norm_text(await items.nth(j).locator(".sale-detail-label").inner_text())
-                                val = norm_text(await items.nth(j).locator(".sale-detail-value").inner_text())
-                                if ("Address" in label or "Property Address" in label):
+                                label = (await items.nth(j).locator(".sale-detail-label").inner_text()).strip()
+                                val = (await items.nth(j).locator(".sale-detail-value").inner_text()).strip()
+                                label_low = label.lower()
+                                if "address" in label_low:
                                     try:
                                         val_html = await items.nth(j).locator(".sale-detail-value").inner_html()
                                         val_html = re.sub(r"<br\s*/?>", " ", val_html)
                                         val_clean = re.sub(r"<.*?>", "", val_html).strip()
-                                        details_address = norm_text(val_clean)
-                                        if not prop_address or len(details_address) > len(prop_address):
-                                            prop_address = details_address
+                                        if not prop_address or len(val_clean) > len(prop_address):
+                                            prop_address = val_clean
                                     except Exception:
                                         if not prop_address:
-                                            prop_address = norm_text(val)
+                                            prop_address = val
                                 elif ("Approx. Judgment" in label or "Approx. Upset" in label
-                                      or "Approximate Judgment:" in label or "Approx Judgment*" in label or "Approx. Upset*" in label 
-                                      or "Debt Amount" in label):
+                                    or "Approximate Judgment:" in label or "Approx Judgment*" in label 
+                                    or "Approx. Upset*" in label or "Debt Amount" in label):
                                     approx_judgment = val
-                                elif "Defendant" in label and not defendant:
+                                elif "defendant" in label_low and not defendant:
                                     defendant = val
-                                elif "Sale Date" in label and not sales_date:
+                                elif "sale" in label_low and "date" in label_low and not sales_date:
                                     sales_date = val
                         except Exception as e:
                             print(f"⚠ Details page error for {county['county_name']} (PropertyId={property_id}): {e}")
                         finally:
-                            # return to list page
                             try:
                                 await self.goto_with_retry(page, url)
                                 await self.dismiss_banners(page)
@@ -361,13 +375,15 @@ class ForeclosureScraper:
                         "Approx Judgment": approx_judgment,
                         "County": county['county_name'],
                     })
+
                 return results
+
             except Exception as e:
                 print(f"❌ Error scraping {county['county_name']} (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
                 await asyncio.sleep(2 ** attempt)
+
         print(f"[FAIL] Could not get complete data for {county['county_name']}")
         return []
-
 # -----------------------------
 # Orchestration
 # -----------------------------
