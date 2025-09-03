@@ -299,7 +299,7 @@ class ForeclosureScraper:
             print(f"[ERROR] Failed to get column mapping: {e}")
             return {}
 
-    async def get_cell_data(self, row, colmap, colname):
+    async def safe_get_cell_text(self, row, colmap, colname):
         """Safely extract text from table cell by column name."""
         try:
             idx = colmap.get(colname)
@@ -411,9 +411,9 @@ class ForeclosureScraper:
                     property_id = extract_property_id_from_href(details_href)
 
                     # Get values by column name, not fixed position - handles any column order
-                    sales_date = await self.get_cell_data(row, colmap, "sales_date")
-                    defendant = await self.get_cell_data(row, colmap, "defendant")
-                    prop_address = await self.get_cell_data(row, colmap, "address")
+                    sales_date = await self.safe_get_cell_text(row, colmap, "sales_date")
+                    defendant = await self.safe_get_cell_text(row, colmap, "defendant")
+                    prop_address = await self.safe_get_cell_text(row, colmap, "address")
 
                     # Get additional data from details page
                     current_data = {
